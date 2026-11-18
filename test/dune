@@ -1,0 +1,3 @@
+(executables
+ (names sim_decoder sim_system)
+ (libraries base stdio hardcaml jpeg_hw))

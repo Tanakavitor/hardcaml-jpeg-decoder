@@ -1,0 +1,24 @@
+# OCaml / dune build output
+_build/
+*.install
+
+# generated test images (recreate with: python3 tools/make_test_images.py testdata)
+testdata/
+
+# Quartus build output
+quartus/db/
+quartus/incremental_db/
+quartus/output_files/
+quartus/simulation/
+quartus/*.qws
+quartus/*.rpt
+quartus/*.summary
+quartus/*.smsg
+quartus/*.jdi
+quartus/*.sld
+quartus/*.done
+
+# Python / OS
+__pycache__/
+*.pyc
+.DS_Store
