@@ -125,47 +125,49 @@ Everything runs on the single 50 MHz clock. Bytes flow left to right; the colour
 about one pixel per cycle.
 
 ```mermaid
-flowchart LR
-    subgraph BOARD["DE10-Standard · Cyclone V (src/system.ml)"]
+flowchart TB
+    subgraph IN["① Input · src/system.ml"]
         direction LR
-        ROM[("JPEG ROM<br/>128 KiB")]:::mem
-        STR["ROM streamer<br/><sub>ready/valid bytes</sub>"]:::io
-
-        subgraph CORE["Decoder core (src/decoder.ml)"]
-            direction LR
-            BB["32-bit bit buffer<br/><sub>unstuffs FF 00,<br/>stops at markers</sub>"]:::core
-            MP["Marker parser<br/><sub>SOI · SOF · DHT · DQT<br/>DRI · SOS · RSTn · EOI</sub>"]:::core
-            HUF["Huffman decoder<br/><sub>16 code lengths<br/>compared in parallel</sub>"]:::core
-            DQ["Dequantise +<br/>de-zigzag<br/><sub>64-register block</sub>"]:::core
-            IDCT["8×8 IDCT<br/><sub>src/idct.ml · 2 passes<br/>6-stage, 39-bit</sub>"]:::dsp
-            MCU[("MCU buffer<br/><sub>16×16 Y · 8×8 Cb, Cr</sub>")]:::mem
-            CC["Upsample +<br/>YCbCr → RGB<br/><sub>libjpeg tables</sub>"]:::dsp
-        end
-
-        FB[("Frame buffer<br/>320×240×24")]:::mem
-        VGAT["VGA timing<br/><sub>640×480 @ 60,<br/>25 MHz enable</sub>"]:::io
-        SUM["Checksum +<br/>status"]:::io
+        ROM[("JPEG ROM<br/>128 KiB · M10K")]:::mem --> STR["ROM streamer<br/><sub>ready/valid byte stream</sub>"]:::io
     end
 
-    MON["🖥️ VGA monitor"]:::out
-    LED["💡 LEDR · HEX5..0"]:::out
+    subgraph ENT["② Entropy decoding · src/decoder.ml"]
+        direction LR
+        BB["32-bit bit buffer<br/><sub>unstuffs FF 00, stops at markers</sub>"]:::core
+        MP["Marker parser<br/><sub>SOI · SOF · DHT · DQT · DRI · SOS · RSTn · EOI</sub>"]:::core
+        HUF["Huffman decoder<br/><sub>16 code lengths compared in parallel</sub>"]:::core
+        DQ["Dequantise + de-zigzag<br/><sub>64-register block</sub>"]:::core
+        BB --> MP -- "tables" --> HUF
+        BB -- "bits" --> HUF --> DQ
+    end
 
-    ROM --> STR --> BB
-    BB --> MP
-    MP -- "tables" --> HUF
-    BB --> HUF --> DQ --> IDCT --> MCU --> CC
-    CC -- "(x, y, R, G, B)" --> FB
-    CC -- "(x, y, R, G, B)" --> SUM
-    FB --> VGAT --> MON
-    SUM --> LED
+    subgraph REC["③ Reconstruction · src/idct.ml + src/decoder.ml"]
+        direction LR
+        IDCT["8×8 IDCT<br/><sub>2 passes · 6-stage · 39-bit<br/>bit-exact jidctint.c</sub>"]:::dsp
+        MCU[("MCU buffer<br/><sub>16×16 Y · 8×8 Cb · 8×8 Cr</sub>")]:::mem
+        CC["Upsample + YCbCr → RGB<br/><sub>libjpeg tables · ~1 px/cycle</sub>"]:::dsp
+        IDCT --> MCU --> CC
+    end
+
+    subgraph OUT["④ Output · src/system.ml"]
+        direction LR
+        FB[("Frame buffer<br/>320×240×24")]:::mem --> VGAT["VGA timing<br/><sub>640×480 @ 60 Hz, 2× scale</sub>"]:::io --> MON["🖥️ VGA monitor"]:::out
+        SUM["Checksum + status"]:::io --> LED["💡 LEDR · HEX5..0"]:::out
+    end
+
+    IN == "bytes" ==> ENT
+    ENT == "8×8 coefficient blocks" ==> REC
+    REC == "(x, y, R, G, B) pixels" ==> OUT
 
     classDef mem fill:#bfdbfe,stroke:#1d4ed8,color:#1f2937
     classDef core fill:#ddd6fe,stroke:#6d28d9,color:#1f2937
     classDef dsp fill:#fbcfe8,stroke:#be185d,color:#1f2937
     classDef io fill:#fef3c7,stroke:#b45309,color:#1f2937
     classDef out fill:#bbf7d0,stroke:#15803d,color:#1f2937
-    style CORE fill:#f5f3ff,stroke:#6d28d9,stroke-dasharray: 4 3
-    style BOARD fill:#f8fafc,stroke:#64748b
+    style IN fill:#fffbeb,stroke:#b45309
+    style ENT fill:#f5f3ff,stroke:#6d28d9
+    style REC fill:#fdf2f8,stroke:#be185d
+    style OUT fill:#f0fdf4,stroke:#15803d
 ```
 
 ### Control: the decoder state machine
