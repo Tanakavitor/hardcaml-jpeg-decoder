@@ -7,6 +7,27 @@ VGA monitor, and checks itself with a checksum shown on the LEDs and 7-segment d
 
 You don't need OCaml to run it: the generated Verilog is already in `quartus/`.
 
+```mermaid
+flowchart LR
+    JPG["🖼️ JPEG file<br/><sub>baseline, ≤ 128 KiB</sub>"]:::sw
+    ROM["💾 On-chip ROM<br/><sub>jpeg_rom.hex</sub>"]:::mem
+    DEC["⚙️ Hardcaml JPEG decoder<br/><sub>parse · Huffman · IDCT · colour</sub>"]:::core
+    FB["🧱 Frame buffer<br/><sub>320×240×24 in M10K</sub>"]:::mem
+    VGA["🖥️ VGA monitor<br/><sub>640×480 @ 60 Hz</sub>"]:::out
+    CHK["✅ Checksum<br/><sub>LEDs + 7-segment</sub>"]:::out
+
+    JPG -- "tools/make_rom.py" --> ROM
+    ROM -- "bytes" --> DEC
+    DEC -- "RGB pixels" --> FB
+    FB -- "2× scaled" --> VGA
+    DEC -- "RGB pixels" --> CHK
+
+    classDef sw fill:#fde68a,stroke:#b45309,color:#1f2937
+    classDef mem fill:#bfdbfe,stroke:#1d4ed8,color:#1f2937
+    classDef core fill:#c4b5fd,stroke:#6d28d9,color:#1f2937,stroke-width:2px
+    classDef out fill:#bbf7d0,stroke:#15803d,color:#1f2937
+```
+
 ---
 
 ## 1. Run it on the board (no OCaml needed)
@@ -98,14 +119,128 @@ files that put each component in its own scan.
 
 ## 4. How it works
 
+### Data path
+
+Everything runs on the single 50 MHz clock. Bytes flow left to right; the colour stage emits
+about one pixel per cycle.
+
+```mermaid
+flowchart TB
+    subgraph IN["① Input · src/system.ml"]
+        direction LR
+        ROM[("JPEG ROM<br/>128 KiB · M10K")]:::mem --> STR["ROM streamer<br/><sub>ready/valid byte stream</sub>"]:::io
+    end
+
+    subgraph ENT["② Entropy decoding · src/decoder.ml"]
+        direction LR
+        BB["32-bit bit buffer<br/><sub>unstuffs FF 00, stops at markers</sub>"]:::core
+        MP["Marker parser<br/><sub>SOI · SOF · DHT · DQT · DRI · SOS · RSTn · EOI</sub>"]:::core
+        HUF["Huffman decoder<br/><sub>16 code lengths compared in parallel</sub>"]:::core
+        DQ["Dequantise + de-zigzag<br/><sub>64-register block</sub>"]:::core
+        BB --> MP -- "tables" --> HUF
+        BB -- "bits" --> HUF --> DQ
+    end
+
+    subgraph REC["③ Reconstruction · src/idct.ml + src/decoder.ml"]
+        direction LR
+        IDCT["8×8 IDCT<br/><sub>2 passes · 6-stage · 39-bit<br/>bit-exact jidctint.c</sub>"]:::dsp
+        MCU[("MCU buffer<br/><sub>16×16 Y · 8×8 Cb · 8×8 Cr</sub>")]:::mem
+        CC["Upsample + YCbCr → RGB<br/><sub>libjpeg tables · ~1 px/cycle</sub>"]:::dsp
+        IDCT --> MCU --> CC
+    end
+
+    subgraph OUT["④ Output · src/system.ml"]
+        direction LR
+        FB[("Frame buffer<br/>320×240×24")]:::mem --> VGAT["VGA timing<br/><sub>640×480 @ 60 Hz, 2× scale</sub>"]:::io --> MON["🖥️ VGA monitor"]:::out
+        SUM["Checksum + status"]:::io --> LED["💡 LEDR · HEX5..0"]:::out
+    end
+
+    IN == "bytes" ==> ENT
+    ENT == "8×8 coefficient blocks" ==> REC
+    REC == "(x, y, R, G, B) pixels" ==> OUT
+
+    classDef mem fill:#bfdbfe,stroke:#1d4ed8,color:#1f2937
+    classDef core fill:#ddd6fe,stroke:#6d28d9,color:#1f2937
+    classDef dsp fill:#fbcfe8,stroke:#be185d,color:#1f2937
+    classDef io fill:#fef3c7,stroke:#b45309,color:#1f2937
+    classDef out fill:#bbf7d0,stroke:#15803d,color:#1f2937
+    style IN fill:#fffbeb,stroke:#b45309
+    style ENT fill:#f5f3ff,stroke:#6d28d9
+    style REC fill:#fdf2f8,stroke:#be185d
+    style OUT fill:#f0fdf4,stroke:#15803d
 ```
- ROM (128 KiB) ─▶ byte stream ─▶ marker parser ─▶ Huffman decoder ─▶ dequantise + de-zigzag
-                                (SOF/DHT/DQT/                         │
-                                 SOS/DRI)                             ▼
- VGA 640x480 ◀─ frame buffer ◀─ colour conversion ◀─ MCU buffer ◀─ 8x8 IDCT (2 passes,
-   (2x2)        320x240x24       + upsampling        (16x16 Y,       6-stage pipeline)
-                                                      8x8 Cb, Cr)
+
+### Control: the decoder state machine
+
+A single state machine in `src/decoder.ml` walks the file's segments, then loops over MCUs
+and 8×8 blocks until the scan ends.
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> SOI: reset
+    SOI --> FindMarker: FF D8
+    SOI --> Error: not a JPEG
+
+    state "Header segments" as Headers {
+        FindMarker --> Dispatch: FF xx
+        Dispatch --> SOF: C0 / C1
+        Dispatch --> DHT: C4
+        Dispatch --> DQT: DB
+        Dispatch --> DRI: DD
+        Dispatch --> Skip: APPn / COM
+        SOF --> FindMarker
+        DHT --> FindMarker
+        DQT --> FindMarker
+        DRI --> FindMarker
+        Skip --> FindMarker
+    }
+
+    Dispatch --> SOS: DA
+    SOS --> Scan
+
+    state "Entropy-coded scan" as Scan {
+        [*] --> Block
+        Block --> Huffman: next coefficient
+        Huffman --> Block: write coef
+        Block --> IDCT: 64 coefs / EOB
+        IDCT --> Block: more blocks in MCU
+        IDCT --> Colour: MCU complete
+        Colour --> [*]
+    }
+
+    Scan --> Scan: next MCU / RSTn
+    Scan --> Finished: last MCU
+    Dispatch --> Finished: EOI (D9)
+    Finished --> [*]
+    Dispatch --> Error: unsupported
 ```
+
+### From OCaml to pixels
+
+```mermaid
+flowchart LR
+    ML["📝 Hardcaml sources<br/><sub>src/*.ml</sub>"]:::sw
+    GEN["dune exec<br/>bin/gen_verilog.exe"]:::tool
+    V["Verilog<br/><sub>quartus/jpeg_system.v<br/>rtl/jpeg_decoder.v</sub>"]:::art
+    PIC["🖼️ your_picture.jpg"]:::sw
+    MK["tools/make_rom.py<br/><sub>+ bit-exact Python model</sub>"]:::tool
+    HEX["jpeg_rom.hex<br/>jpeg_expected.vh"]:::art
+    Q["Quartus compile"]:::tool
+    SOF["jpeg_de10.sof"]:::art
+    B["🔌 DE10-Standard"]:::out
+
+    ML --> GEN --> V --> Q
+    PIC --> MK --> HEX --> Q
+    Q --> SOF -- "USB-Blaster II" --> B
+
+    classDef sw fill:#fde68a,stroke:#b45309,color:#1f2937
+    classDef tool fill:#e2e8f0,stroke:#475569,color:#1f2937
+    classDef art fill:#bfdbfe,stroke:#1d4ed8,color:#1f2937
+    classDef out fill:#bbf7d0,stroke:#15803d,color:#1f2937
+```
+
+### The pieces
 
 * `src/decoder.ml`: the decoder core. A single state machine parses the markers and drives
   the entropy decoder. The 32-bit bit buffer refills in the background, removes stuffed
